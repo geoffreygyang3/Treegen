@@ -14,6 +14,12 @@
 (define-constant ERR_CANNOT_BUY_OWN_CREDIT (err u112))
 (define-constant ERR_CREDIT_NOT_FOR_SALE (err u113))
 (define-constant ERR_INVALID_EXPIRY (err u114))
+(define-constant ERR_INVALID_HEALTH_STATUS (err u115))
+(define-constant ERR_MONITORING_NOT_ACTIVE (err u116))
+(define-constant ERR_ALREADY_MONITORED (err u117))
+(define-constant ERR_INSUFFICIENT_VALIDATORS (err u118))
+(define-constant ERR_ALREADY_VALIDATED (err u119))
+(define-constant ERR_MONITORING_EXPIRED (err u120))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var proof-counter uint u0)
@@ -24,6 +30,11 @@
 (define-data-var total-credits-minted uint u0)
 (define-data-var total-credits-traded uint u0)
 (define-data-var credit-to-tree-ratio uint u10)
+(define-data-var monitoring-counter uint u0)
+(define-data-var total-trees-monitored uint u0)
+(define-data-var total-health-assessments uint u0)
+(define-data-var survival-bonus-per-tree uint u25000)
+(define-data-var min-validators-required uint u3)
 
 (define-map proposals uint {
     id: uint,
@@ -81,6 +92,46 @@
 (define-map user-carbon-balances principal uint)
 (define-map credit-ownership-history uint (list 10 {owner: principal, transferred-at: uint}))
 (define-map retired-credits principal uint)
+
+(define-map tree-monitoring-records uint {
+    id: uint,
+    proof-id: uint,
+    planter: principal,
+    tree-count: uint,
+    location: (string-ascii 100),
+    species: (string-ascii 50),
+    monitoring-start: uint,
+    monitoring-end: uint,
+    status: (string-ascii 20),
+    survival-rate: uint,
+    health-score: uint,
+    validators-needed: uint,
+    validators-confirmed: uint,
+    total-bonus-earned: uint
+})
+
+(define-map health-assessments uint {
+    id: uint,
+    monitoring-id: uint,
+    validator: principal,
+    assessment-date: uint,
+    health-status: uint,
+    survival-count: uint,
+    notes: (string-ascii 200),
+    photo-hash: (string-ascii 64)
+})
+
+(define-map monitoring-validators {monitoring-id: uint, validator: principal} {
+    validated: bool,
+    assessment-id: uint
+})
+
+(define-map user-monitoring-stats principal {
+    total-monitored: uint,
+    total-survived: uint,
+    total-bonus-earned: uint,
+    validator-assessments: uint
+})
 
 (define-public (create-proposal (title (string-ascii 100)) (description (string-ascii 500)) (location (string-ascii 100)) (tree-count uint) (funding-goal uint))
     (let ((proposal-id (+ (var-get proposal-counter) u1))
@@ -281,6 +332,146 @@
         (map-set retired-credits tx-sender (+ (default-to u0 (map-get? retired-credits tx-sender)) credits-amount))
         (ok true)))
 
+(define-public (start-tree-monitoring (proof-id uint) (species (string-ascii 50)) (monitoring-duration uint))
+    (let ((proof (unwrap! (map-get? planting-proofs proof-id) ERR_NOT_FOUND))
+          (monitoring-id (+ (var-get monitoring-counter) u1)))
+        (asserts! (is-eq (get status proof) "verified") ERR_PROOF_NOT_PENDING)
+        (asserts! (is-eq (get planter proof) tx-sender) ERR_UNAUTHORIZED)
+        (asserts! (> monitoring-duration u0) ERR_INVALID_AMOUNT)
+        (asserts! (is-none (map-get? tree-monitoring-records monitoring-id)) ERR_ALREADY_MONITORED)
+        (map-set tree-monitoring-records monitoring-id {
+            id: monitoring-id,
+            proof-id: proof-id,
+            planter: tx-sender,
+            tree-count: (get tree-count proof),
+            location: (get location proof),
+            species: species,
+            monitoring-start: stacks-block-height,
+            monitoring-end: (+ stacks-block-height monitoring-duration),
+            status: "active",
+            survival-rate: u0,
+            health-score: u0,
+            validators-needed: (var-get min-validators-required),
+            validators-confirmed: u0,
+            total-bonus-earned: u0
+        })
+        (var-set monitoring-counter monitoring-id)
+        (var-set total-trees-monitored (+ (var-get total-trees-monitored) (get tree-count proof)))
+        (let ((current-stats (default-to {total-monitored: u0, total-survived: u0, total-bonus-earned: u0, validator-assessments: u0} 
+                                        (map-get? user-monitoring-stats tx-sender))))
+            (map-set user-monitoring-stats tx-sender (merge current-stats {
+                total-monitored: (+ (get total-monitored current-stats) (get tree-count proof))
+            })))
+        (ok monitoring-id)))
+
+(define-public (submit-health-assessment (monitoring-id uint) (health-status uint) (survival-count uint) (notes (string-ascii 200)) (photo-hash (string-ascii 64)))
+    (let ((monitoring-record (unwrap! (map-get? tree-monitoring-records monitoring-id) ERR_NOT_FOUND))
+          (assessment-id (+ (var-get total-health-assessments) u1))
+          (validator-key {monitoring-id: monitoring-id, validator: tx-sender}))
+        (asserts! (is-eq (get status monitoring-record) "active") ERR_MONITORING_NOT_ACTIVE)
+        (asserts! (< stacks-block-height (get monitoring-end monitoring-record)) ERR_MONITORING_EXPIRED)
+        (asserts! (is-none (map-get? monitoring-validators validator-key)) ERR_ALREADY_VALIDATED)
+        (asserts! (<= health-status u100) ERR_INVALID_HEALTH_STATUS)
+        (asserts! (<= survival-count (get tree-count monitoring-record)) ERR_INVALID_AMOUNT)
+        (map-set health-assessments assessment-id {
+            id: assessment-id,
+            monitoring-id: monitoring-id,
+            validator: tx-sender,
+            assessment-date: stacks-block-height,
+            health-status: health-status,
+            survival-count: survival-count,
+            notes: notes,
+            photo-hash: photo-hash
+        })
+        (map-set monitoring-validators validator-key {
+            validated: true,
+            assessment-id: assessment-id
+        })
+        (let ((updated-record (merge monitoring-record {
+                validators-confirmed: (+ (get validators-confirmed monitoring-record) u1)
+            })))
+            (map-set tree-monitoring-records monitoring-id updated-record)
+            (var-set total-health-assessments assessment-id)
+            (let ((current-stats (default-to {total-monitored: u0, total-survived: u0, total-bonus-earned: u0, validator-assessments: u0} 
+                                            (map-get? user-monitoring-stats tx-sender))))
+                (map-set user-monitoring-stats tx-sender (merge current-stats {
+                    validator-assessments: (+ (get validator-assessments current-stats) u1)
+                })))
+            (if (>= (get validators-confirmed updated-record) (get validators-needed updated-record))
+                (begin
+                    (try! (finalize-monitoring monitoring-id))
+                    (ok assessment-id))
+                (ok assessment-id)))))
+
+(define-public (finalize-monitoring (monitoring-id uint))
+    (let ((monitoring-record (unwrap! (map-get? tree-monitoring-records monitoring-id) ERR_NOT_FOUND)))
+        (asserts! (is-eq (get status monitoring-record) "active") ERR_MONITORING_NOT_ACTIVE)
+        (asserts! (>= (get validators-confirmed monitoring-record) (get validators-needed monitoring-record)) ERR_INSUFFICIENT_VALIDATORS)
+        (let ((assessments (get-monitoring-assessments monitoring-id))
+              (avg-survival-rate (calculate-average-survival-rate monitoring-id))
+              (avg-health-score (calculate-average-health-score monitoring-id))
+              (planter (get planter monitoring-record))
+              (bonus-amount (* avg-survival-rate (var-get survival-bonus-per-tree))))
+            (map-set tree-monitoring-records monitoring-id (merge monitoring-record {
+                status: "completed",
+                survival-rate: avg-survival-rate,
+                health-score: avg-health-score,
+                total-bonus-earned: bonus-amount
+            }))
+            (if (> bonus-amount u0)
+                (begin
+                    (map-set user-rewards planter (+ (default-to u0 (map-get? user-rewards planter)) bonus-amount))
+                    (var-set total-stx-distributed (+ (var-get total-stx-distributed) bonus-amount))
+                    (let ((current-stats (default-to {total-monitored: u0, total-survived: u0, total-bonus-earned: u0, validator-assessments: u0} 
+                                                    (map-get? user-monitoring-stats planter))))
+                        (map-set user-monitoring-stats planter (merge current-stats {
+                            total-survived: (+ (get total-survived current-stats) avg-survival-rate),
+                            total-bonus-earned: (+ (get total-bonus-earned current-stats) bonus-amount)
+                        }))))
+                false)
+            (ok true))))
+
+(define-private (calculate-average-survival-rate (monitoring-id uint))
+    (let ((assessments (get-assessments-for-monitoring monitoring-id)))
+        (if (> (len assessments) u0)
+            (/ (fold + (map get-survival-count assessments) u0) (len assessments))
+            u0)))
+
+(define-private (calculate-average-health-score (monitoring-id uint))
+    (let ((assessments (get-assessments-for-monitoring monitoring-id)))
+        (if (> (len assessments) u0)
+            (/ (fold + (map get-health-status assessments) u0) (len assessments))
+            u0)))
+
+(define-private (get-assessments-for-monitoring (monitoring-id uint))
+    (filter is-matching-assessment (list 
+        (map-get? health-assessments u1) (map-get? health-assessments u2) (map-get? health-assessments u3)
+        (map-get? health-assessments u4) (map-get? health-assessments u5))))
+
+(define-private (is-matching-assessment (assessment (optional {id: uint, monitoring-id: uint, validator: principal, assessment-date: uint, health-status: uint, survival-count: uint, notes: (string-ascii 200), photo-hash: (string-ascii 64)})))
+    (match assessment
+        some-assessment true
+        false))
+
+(define-private (get-survival-count (assessment (optional {id: uint, monitoring-id: uint, validator: principal, assessment-date: uint, health-status: uint, survival-count: uint, notes: (string-ascii 200), photo-hash: (string-ascii 64)})))
+    (match assessment
+        some-assessment (get survival-count some-assessment)
+        u0))
+
+(define-private (get-health-status (assessment (optional {id: uint, monitoring-id: uint, validator: principal, assessment-date: uint, health-status: uint, survival-count: uint, notes: (string-ascii 200), photo-hash: (string-ascii 64)})))
+    (match assessment
+        some-assessment (get health-status some-assessment)
+        u0))
+
+(define-public (update-monitoring-settings (new-min-validators uint) (new-survival-bonus uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-min-validators u0) ERR_INVALID_AMOUNT)
+        (asserts! (> new-survival-bonus u0) ERR_INVALID_AMOUNT)
+        (var-set min-validators-required new-min-validators)
+        (var-set survival-bonus-per-tree new-survival-bonus)
+        (ok true)))
+
 (define-public (update-credit-to-tree-ratio (new-ratio uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -404,3 +595,54 @@
 
 (define-read-only (calculate-credits-from-trees (tree-count uint))
     (/ tree-count (var-get credit-to-tree-ratio)))
+
+(define-read-only (get-monitoring-record (monitoring-id uint))
+    (map-get? tree-monitoring-records monitoring-id))
+
+(define-read-only (get-health-assessment (assessment-id uint))
+    (map-get? health-assessments assessment-id))
+
+(define-read-only (get-user-monitoring-stats (user principal))
+    (default-to {total-monitored: u0, total-survived: u0, total-bonus-earned: u0, validator-assessments: u0} 
+                (map-get? user-monitoring-stats user)))
+
+(define-read-only (get-monitoring-system-stats)
+    {
+        total-monitoring-records: (var-get monitoring-counter),
+        total-trees-monitored: (var-get total-trees-monitored),
+        total-health-assessments: (var-get total-health-assessments),
+        survival-bonus-per-tree: (var-get survival-bonus-per-tree),
+        min-validators-required: (var-get min-validators-required)
+    })
+
+(define-read-only (is-monitoring-active (monitoring-id uint))
+    (match (map-get? tree-monitoring-records monitoring-id)
+        record (and (is-eq (get status record) "active")
+                   (< stacks-block-height (get monitoring-end record)))
+        false))
+
+(define-read-only (get-monitoring-progress (monitoring-id uint))
+    (match (map-get? tree-monitoring-records monitoring-id)
+        record (some {
+            validators-confirmed: (get validators-confirmed record),
+            validators-needed: (get validators-needed record),
+            monitoring-end: (get monitoring-end record),
+            blocks-remaining: (if (> (get monitoring-end record) stacks-block-height)
+                                (- (get monitoring-end record) stacks-block-height)
+                                u0)
+        })
+        none))
+
+(define-read-only (calculate-expected-survival-bonus (monitoring-id uint) (expected-survival-rate uint))
+    (match (map-get? tree-monitoring-records monitoring-id)
+        record (* expected-survival-rate (var-get survival-bonus-per-tree))
+        u0))
+
+(define-private (get-monitoring-assessments (monitoring-id uint))
+    (list))
+
+(define-read-only (get-validator-status (monitoring-id uint) (validator principal))
+    (map-get? monitoring-validators {monitoring-id: monitoring-id, validator: validator}))
+
+
+
